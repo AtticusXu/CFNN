@@ -6,6 +6,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 import time
 
 
@@ -117,6 +118,64 @@ class CFNN:
         total_parameters = 0
         for variable in self.trainable_variables:
             # shape is an array of tf.Dimension
+            shape = variable.get_shape()
+            variable_parameters = 1
+            for dim in shape:
+                variable_parameters *= dim
+            total_parameters += variable_parameters
+        print(total_parameters)
+
+    @property
+    def trainable_variables(self):
+        return self.weights + self.biases
+
+
+class DNN:
+    def __init__(self, layers, datatype):
+        self.layers = layers
+        self.num_layers = len(layers) - 1
+        self.datatype = datatype
+        self.weights, self.biases = self.initialize_NN(layers)
+
+        # All layers use tanh except the last one which uses identity
+        self.activations = [tf.tanh] * (self.num_layers - 1) + [tf.identity]
+
+    def initialize_NN(self, layers):
+        weights = []
+        biases = []
+
+        # Initialize all layers using MPL_init
+        for l in range(self.num_layers):
+            W = self.MPL_init(size=[layers[l], layers[l + 1]])
+            b = tf.Variable(tf.zeros([1, layers[l + 1]], dtype=self.datatype))
+            weights.append(W)
+            biases.append(b)
+
+        return weights, biases
+
+    def MPL_init(self, size):
+        in_dim = size[0]
+        out_dim = size[1]
+        xavier_stddev = np.sqrt(2 / (in_dim + out_dim))
+        return tf.Variable(
+            tf.random.truncated_normal(
+                [in_dim, out_dim], stddev=xavier_stddev, dtype=self.datatype
+            )
+        )
+
+    def forward(self, X):
+        H = X
+        # Standard feedforward for all layers
+        for l in range(self.num_layers):
+            W = self.weights[l]
+            b = self.biases[l]
+            H = self.activations[l](tf.add(tf.matmul(H, W), b))
+
+        return H
+
+    def count_trainable_variables(self):
+        total_parameters = 0
+        for variable in self.trainable_variables:
             shape = variable.get_shape()
             variable_parameters = 1
             for dim in shape:
@@ -397,11 +456,6 @@ def save_results(
     save_dir = os.path.join(base_dir, example_name)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Flatten losses from all stages into a single list
-    all_losses = []
-    for stage_losses in losses:
-        all_losses.extend(stage_losses)
-
     # Save data as .mat file for MATLAB compatibility
     savemat(
         os.path.join(save_dir, "results.mat"),
@@ -412,17 +466,16 @@ def save_results(
             "x_test": x_test.numpy(),
             "preds_train": [p.numpy() for p in preds_train],
             "preds_test": [p.numpy() for p in preds_test],
-            "losses": all_losses,
+            "losses": losses,
         },
     )
 
 
-def make_plots(example_name: str, iters: list, base_dir: str = "./results"):
+def make_plots(example_name: str, base_dir: str = "./results"):
     """Create plots from saved training results.
 
     Args:
         example_name: Name of the example/function
-        iters: List of iteration numbers where each stage ends, e.g. [15000, 25000, 35000, 45000]
         base_dir: Base directory where results are saved
     """
 
@@ -439,31 +492,40 @@ def make_plots(example_name: str, iters: list, base_dir: str = "./results"):
     losses = results["losses"].squeeze()
 
     # 1. Loss Plot
-    plt.figure(figsize=(10, 6))
-    plt.semilogy(losses)
+    actual_iters = [len(stage_losses.flatten()) for stage_losses in losses]
+    print(actual_iters)
+    plt.figure(figsize=(12, 6))
+    # Flatten and concatenate all loss arrays
+    all_losses = np.concatenate([stage_loss.flatten() for stage_loss in losses])
+    plt.semilogy(all_losses)
 
     # Add vertical lines at the end of each stage
-    for i in range(len(iters) - 1):  # Don't plot line for last stage
-        plt.axvline(x=sum(iters[: i + 1]), color="r", linestyle="--", alpha=0.5)
+    for i in range(len(actual_iters) - 1):  # Don't plot line for last stage
+        plt.axvline(x=sum(actual_iters[: i + 1]), color="r", linestyle="--", alpha=0.5)
 
     # Add stage labels
-    for i in range(len(iters)):
-        start = 0 if i == 0 else sum(iters[:i])
-        end = sum(iters[: i + 1])
+    for i in range(len(actual_iters)):
+        start = 0 if i == 0 else sum(actual_iters[:i])
+        end = sum(actual_iters[: i + 1])
         mid_point = start + (end - start) // 2
         plt.text(
-            mid_point, plt.ylim()[0] * 1.1, f"Stage {i+1}", horizontalalignment="center"
+            mid_point,
+            plt.ylim()[0] + 0.1,
+            f"$\\mathrm{{Stage}}~{i}$",
+            horizontalalignment="center",
+            fontsize=14,
         )
 
-    plt.grid(True)
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
+    plt.xlabel("$\\mathrm{Epochs}$", fontsize=14)
+    plt.ylabel("$\\mathrm{Loss}$", fontsize=14)
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
     plt.tight_layout()
-    plt.savefig(os.path.join(base_dir, example_name, "loss_history.png"), dpi=600)
+    plt.savefig(os.path.join(base_dir, example_name, "loss_history.pdf"), dpi=600)
     plt.close()
 
     # 2. Training Results Plot
-    fig, axes = plt.subplots(4, 1, figsize=(15, 12))
+    fig, axes = plt.subplots(5, 1, figsize=(12, 15))
     axes = axes.flatten()
 
     # Plot each stage's residual and network output
@@ -479,107 +541,313 @@ def make_plots(example_name: str, iters: list, base_dir: str = "./results"):
         residual_plot = residual[mask][sort_idx]
         pred_plot = preds_train[i][mask][sort_idx]
 
-        axes[i].plot(t_plot, residual_plot, "b-", linewidth=2, label="Residual")
-        axes[i].plot(t_plot, pred_plot, "r--", linewidth=2, label="Network Output")
-        axes[i].legend()
+        axes[i].plot(
+            t_plot,
+            residual_plot,
+            "b-",
+            linewidth=2,
+            label="$f(x)$" if i == 0 else "$E_{%d}(x)$" % i,
+        )
+        axes[i].plot(
+            t_plot,
+            pred_plot,
+            "r--",
+            linewidth=2,
+            label=(
+                "$N_{\mathtt{CF}}^{(0)}(x)$"
+                if i == 0
+                else "$\epsilon_{%d}N_{\mathtt{CF}}^{(%d)}(x)$" % (i, i)
+            ),
+        )
+        axes[i].legend(fontsize=12, loc="upper right")
         axes[i].set_xlim([-1, 1])
+        axes[i].tick_params(axis="x", labelsize=12)
+        axes[i].tick_params(axis="y", labelsize=12)
+
+    # Plot final residual E_4
+    mask = (t_train >= -1) & (t_train <= 1)
+    t_plot = t_train[mask]
+    sort_idx = np.argsort(t_plot)
+    t_plot = t_plot[sort_idx]
+    final_residual = x_train - sum(preds_train)
+    final_residual_plot = final_residual[mask][sort_idx]
+
+    axes[4].plot(t_plot, final_residual_plot, "b-", linewidth=2, label="$E_{4}(x)$")
+    axes[4].legend(fontsize=12, loc="upper right")
+    axes[4].set_xlim([-1, 1])
+    axes[4].tick_params(axis="x", labelsize=12)
+    axes[4].tick_params(axis="y", labelsize=12)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(base_dir, example_name, "training_results.png"), dpi=600)
+    plt.savefig(os.path.join(base_dir, example_name, "training_results.pdf"), dpi=600)
     plt.close()
 
     # 3. Test Results Plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6))
 
     # Final prediction (sum of all stages)
     final_pred_test = sum(preds_test)
 
+    sort_idx = np.argsort(t_test)
+    t_test = t_test[sort_idx]
+    x_test = x_test[sort_idx]
+    final_pred_test = final_pred_test[sort_idx]
     # Plot test results
     ax1.plot(t_test, x_test, "b-", linewidth=2, label="Ground Truth")
     ax1.plot(t_test, final_pred_test, "r--", linewidth=2, label="Prediction")
-    ax1.legend()
+    ax1.set_xlim([-1.0, 1.0])
+    ax1.tick_params(axis="x", labelsize=12)
+    ax1.tick_params(axis="y", labelsize=12)
+    ax1.legend(fontsize=12, loc="upper right")
 
     # Plot error
     error = x_test.squeeze() - final_pred_test
     ax2.plot(t_test, error, "k-", linewidth=2, label="Error")
-    ax2.legend()
+    ax2.set_xlim([-1.0, 1.0])
+    ax2.tick_params(axis="x", labelsize=12)
+    ax2.tick_params(axis="y", labelsize=12)
+    ax2.legend(fontsize=12, loc="upper right")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(base_dir, example_name, "test_results.png"))
+    plt.savefig(os.path.join(base_dir, example_name, "test_results.pdf"), dpi=600)
     plt.close()
 
 
-if __name__ == "__main__":
+def make_combined_plot(example_name: str, base_dir: str = "./results"):
+    # Load and extract data (keep existing code)
+    results = loadmat(os.path.join(base_dir, example_name, "results.mat"))
+    t_train = results["t_train"].squeeze()
+    x_train = results["x_train"].squeeze()
+    t_test = results["t_test"].squeeze()
+    x_test = results["x_test"].squeeze()
+    preds_train = [pred.squeeze() for pred in results["preds_train"]]
+    preds_test = [pred.squeeze() for pred in results["preds_test"]]
+    losses = results["losses"].squeeze()
 
-    noise = 0.0
+    # Create figure with custom layout
+    fig = plt.figure(figsize=(20, 12))
+    gs = plt.GridSpec(3, 2, height_ratios=[1, 0.8, 0.2])
 
-    np.random.seed(234)
-    tf.random.set_seed(234)
+    # 1. Loss Plot (top left)
+    ax_loss = fig.add_subplot(gs[0, 0])
+    all_losses = np.concatenate([stage_loss.flatten() for stage_loss in losses])
+    ax_loss.semilogy(all_losses)
 
-    N_tr = 300
-    N_pd = 200
-    layers = [1, 20, 20, 20, 1]
-    lyscl = [1, 1, 1, 1]
+    actual_iters = [len(stage_losses.flatten()) for stage_losses in losses]
+    for i in range(len(actual_iters) - 1):
+        ax_loss.axvline(
+            x=sum(actual_iters[: i + 1]), color="r", linestyle="--", alpha=0.5
+        )
 
-    def fun_test(t, mode):
-        # customize the function by the user
-        # x = t**2 + 0.05*tf.sin(10*np.pi*t)
-        x = tf.sin(2 * t + 1) + 0.2 * tf.exp(1.3 * t)
-        return x
+    for i in range(len(actual_iters)):
+        start = 0 if i == 0 else sum(actual_iters[:i])
+        end = sum(actual_iters[: i + 1])
+        mid_point = start + (end - start) // 2
+        ax_loss.text(
+            mid_point,
+            ax_loss.get_ylim()[0] + 0.08,
+            f"$\\mathrm{{Stage}}~{i}$",
+            horizontalalignment="center",
+            fontsize=14,
+        )
 
-    t = np.linspace(-1.05, 1.05, N_tr)[:, None]
-    # t = lhs(1, N_tr) * 2 - 1
-    t_train = tf.cast(t, dtype=tf.float64)
-    x_train = fun_test(t_train, 1)
+    ax_loss.set_xlabel("$\\mathrm{Epochs}$", fontsize=14)
+    ax_loss.set_ylabel("$\\mathrm{Loss}$", fontsize=14)
+    ax_loss.tick_params(labelsize=12)
+    ax_loss.set_title("Training Loss", fontsize=14)
 
-    # Domain bounds
-    lt = t.min(0)
-    ut = t.max(0)
+    # 2. Test Results Plot (bottom left)
+    gs_test = GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[1:, 0])
+    ax_test1 = fig.add_subplot(gs_test[0])
+    ax_test2 = fig.add_subplot(gs_test[1])
 
-    t_intp = np.linspace(-1, 1, N_pd)[:, None]
-    t_intp = tf.cast(t_intp, dtype=tf.float64)
-    x_intp = fun_test(t_intp, 0)
+    final_pred_test = sum(preds_test)
+    sort_idx = np.argsort(t_test)
+    t_test_sorted = t_test[sort_idx]
+    x_test_sorted = x_test[sort_idx]
+    final_pred_test_sorted = final_pred_test[sort_idx]
 
+    ax_test1.plot(t_test_sorted, x_test_sorted, "b-", linewidth=2, label="Ground Truth")
+    ax_test1.plot(
+        t_test_sorted, final_pred_test_sorted, "r--", linewidth=2, label="Prediction"
+    )
+    ax_test1.set_xlim([-1.0, 1.0])
+    ax_test1.tick_params(labelsize=12)
+    ax_test1.legend(fontsize=12, loc="upper right")
+    ax_test1.set_title("Test Result", fontsize=14)
+
+    error = x_test_sorted - final_pred_test_sorted
+    ax_test2.plot(t_test_sorted, error, "k-", linewidth=2, label="Error")
+    ax_test2.set_xlim([-1.0, 1.0])
+    ax_test2.tick_params(labelsize=12)
+    ax_test2.legend(fontsize=12, loc="upper right")
+    ax_test2.set_title("Test Error", fontsize=14)
+
+    # 3. Training Results Plot (right side)
+    gs_train = GridSpecFromSubplotSpec(5, 1, subplot_spec=gs[:, 1])
+
+    for i in range(5):
+        ax = fig.add_subplot(gs_train[i])
+
+        mask = (t_train >= -1) & (t_train <= 1)
+        t_plot = t_train[mask]
+        sort_idx = np.argsort(t_plot)
+        t_plot = t_plot[sort_idx]
+
+        if i < 4:
+            residual = x_train - sum(preds_train[:i]) if i > 0 else x_train
+            residual_plot = residual[mask][sort_idx]
+            pred_plot = preds_train[i][mask][sort_idx]
+
+            ax.plot(
+                t_plot,
+                residual_plot,
+                "b-",
+                linewidth=2,
+                label="$f(x)$" if i == 0 else "$E_{%d}(x)$" % i,
+            )
+            ax.plot(
+                t_plot,
+                pred_plot,
+                "r--",
+                linewidth=2,
+                label=(
+                    "$N_{\mathtt{CF}}^{(0)}(x)$"
+                    if i == 0
+                    else "$\mathrm{\epsilon}_{%d}N_{\mathtt{CF}}^{(%d)}(x)$" % (i, i)
+                ),
+            )
+        else:
+            # Plot final residual E_4
+            residual = x_train - sum(preds_train[:4])
+            residual_plot = residual[mask][sort_idx]
+            ax.plot(
+                t_plot,
+                residual_plot,
+                "b-",
+                linewidth=2,
+                label="$E_{4}(x)$",
+            )
+
+        ax.legend(fontsize=12, loc="upper right")
+        ax.set_xlim([-1, 1])
+        ax.tick_params(labelsize=12)
+        ax.set_title(f"Training Stage {i}" if i < 4 else "Training Error", fontsize=14)
+
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(base_dir, example_name, "combined_results.pdf"),
+        dpi=600,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def make_compare_plot(example_names: list, base_dir: str = "./results"):
+    """Create comparison plots for two different methods.
+
+    Args:
+        example_names: List of two example names to compare
+        base_dir: Base directory where results are saved
     """
-    training the model for the first time
-    """
-    # NN = SinNN(layers, 1, tf.float64, acts=0)
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(3, 2, height_ratios=[1, 0.4, 0.4])
 
-    fl_ini = ExpPlus(0.5, 0, tf.float64)
-    NN = CFNN(layers, fl_ini, tf.float64)
+    # Load results for both methods
+    results = []
+    for name in example_names:
+        results.append(loadmat(os.path.join(base_dir, name, "results.mat")))
 
-    model = MultiStageNN(t_train, x_train, NN, lt, ut, adam_lr=0.001)
-    model.train(1000, 1)
-    model.train(1000, 2)
-    x_pred = model.predict(t_intp)
+    # Plot training loss (top row)
+    for idx, (name, result) in enumerate(zip(example_names, results)):
+        ax = fig.add_subplot(gs[0, idx])
 
-    x_train2 = x_train - model.predict(t_train)
+        # Combine all losses
+        losses = result["losses"].squeeze()
+        all_losses = np.concatenate([stage_loss.flatten() for stage_loss in losses])
 
-    error_x = np.linalg.norm(x_intp - x_pred, 2) / np.linalg.norm(x_intp, 2)
-    print("Error u: %e" % (error_x))
+        ax.semilogy(all_losses)
 
-    xmin = x_intp.numpy().min()
-    xmax = x_intp.numpy().max()
+        # Add vertical lines for stages if more than one stage
+        actual_iters = [len(stage_losses.flatten()) for stage_losses in losses]
+        if len(actual_iters) == 4:
+            for i in range(len(actual_iters) - 1):
+                ax.axvline(
+                    x=sum(actual_iters[: i + 1]), color="r", linestyle="--", alpha=0.5
+                )
+            for i in range(len(actual_iters)):
+                start = 0 if i == 0 else sum(actual_iters[:i])
+                end = sum(actual_iters[: i + 1])
+                mid_point = start + (end - start) // 2
+                ax.text(
+                    mid_point,
+                    ax.get_ylim()[0] + 0.08,
+                    f"$\\mathrm{{Stage}}~{i}$",
+                    horizontalalignment="center",
+                    fontsize=14,
+                )
 
-    ######################################################################
-    ############################# Plotting ###############################
-    ######################################################################
+        ax.set_xlabel("$\\mathrm{Epochs}$", fontsize=14)
+        ax.set_ylabel("$\\mathrm{Loss}$", fontsize=14)
+        ax.tick_params(labelsize=12)
+        ax.set_title("Training Loss", fontsize=14)
 
-    # %%
-    fig = plt.figure(figsize=[10, 8], dpi=100)
+    # Plot training results (middle row)
+    for idx, (name, result) in enumerate(zip(example_names, results)):
+        ax = fig.add_subplot(gs[1, idx])
 
-    ax = plt.subplot(211)
-    ax.plot(t_intp, x_intp, "b-", linewidth=2, label="Exact")
-    ax.plot(t_intp, x_pred, "r--", linewidth=2, label="Prediction")
-    ax.set_ylabel("$x$", fontsize=15, rotation=0)
-    ax.set_title("Function", fontsize=10)
-    ax.set_xlim([-1.05, 1.05])
-    ax.set_ylim([xmin, xmax])
+        t_train = result["t_train"].squeeze()
+        x_train = result["x_train"].squeeze()
+        preds_train = [pred.squeeze() for pred in result["preds_train"]]
 
-    ax1 = plt.subplot(212)
-    ax1.plot(t_train, x_train2, "b.", linewidth=2, label="Exact")
-    ax1.set_ylabel("$x$", fontsize=15, rotation=0)
-    ax1.set_title("Residue order 1", fontsize=10)
-    ax1.set_xlim([-1.05, 1.05])
+        # Final prediction (sum of all stages)
+        final_pred_train = sum(preds_train)
 
-    plt.show()
+        # Sort for plotting
+        mask = (t_train >= -1) & (t_train <= 1)
+        t_plot = t_train[mask]
+        sort_idx = np.argsort(t_plot)
+        t_plot = t_plot[sort_idx]
+        x_train_plot = x_train[mask][sort_idx]
+        final_pred_train_plot = final_pred_train[mask][sort_idx]
+
+        # Calculate training error
+        train_error = x_train_plot - final_pred_train_plot
+
+        ax.plot(t_plot, train_error, "k-", linewidth=2)
+        ax.set_xlim([-1.0, 1.0])
+        ax.tick_params(labelsize=12)
+        ax.set_title("Training Error", fontsize=14)
+        ax.set_xlabel("$x$", fontsize=14)
+        ax.set_ylabel("Error", fontsize=14)
+
+    # Plot test results (bottom row)
+    for idx, (name, result) in enumerate(zip(example_names, results)):
+        ax = fig.add_subplot(gs[2, idx])
+
+        t_test = result["t_test"].squeeze()
+        x_test = result["x_test"].squeeze()
+        preds_test = [pred.squeeze() for pred in result["preds_test"]]
+
+        # Final prediction (sum of all stages)
+        final_pred_test = sum(preds_test)
+
+        # Sort for plotting
+        sort_idx = np.argsort(t_test)
+        t_test = t_test[sort_idx]
+        x_test = x_test[sort_idx]
+        final_pred_test = final_pred_test[sort_idx]
+
+        # Calculate test error
+        test_error = x_test - final_pred_test
+
+        ax.plot(t_test, test_error, "k-", linewidth=2)
+        ax.set_xlim([-1.0, 1.0])
+        ax.tick_params(labelsize=12)
+        ax.set_title("Test Error", fontsize=14)
+        ax.set_xlabel("$x$", fontsize=14)
+        ax.set_ylabel("Error", fontsize=14)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_dir, "comparison.pdf"), dpi=600, bbox_inches="tight")
+    plt.close()
